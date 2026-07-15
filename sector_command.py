@@ -129,53 +129,109 @@ async def scrape_sector_news_headlines(sector_name: str) -> List[str]:
 # --- Main Command Handler ---
 
 async def handle_sector_command(args: List[str], ai_params: Optional[Dict] = None, is_called_by_ai: bool = False):
+    # --- MODIFICATION: Removed AI block and added robust input handling ---
+    # if is_called_by_ai:
+    #     return {"status": "error_invalid_tool", "message": "This function is not for AI use. Use 'find_and_screen_stocks'."}
+
+    input_str = ""
     if is_called_by_ai:
-        return {"status": "error_invalid_tool", "message": "This function is not for AI use. Use 'find_and_screen_stocks'."}
+        if not ai_params or "sector_name" not in ai_params:
+            return {"status": "error_missing_param", "message": "Missing 'sector_name' parameter."}
+        input_str = ai_params.get("sector_name", "")
+    else: # CLI user
+        print("\n--- Industry & Sector Analysis Engine ---")
+        if not args:
+            print("Usage: /sector <GICS_CODE | Sector/Industry Name | \"Market\">")
+            return
+        input_str = " ".join(args)
+    
+    if not input_str:
+        msg = "Error: No sector name provided."
+        if is_called_by_ai: return {"status": "error", "message": msg}
+        else: print(msg); return
+    # --- END MODIFICATION ---
 
-    print("\n--- Industry & Sector Analysis Engine ---")
-    if not args:
-        print("Usage: /sector <GICS_CODE | Sector/Industry Name | \"Market\">")
-        return
-
-    input_str = " ".join(args)
     sector_name = input_str.strip('\"')
     all_tickers = get_all_gics_tickers() if sector_name.lower() == 'market' else filter_stocks_by_gics(sector_name)
 
     if not all_tickers:
-        print(f"-> No tickers found for '{sector_name}'.")
-        return
+        msg = f"-> No tickers found for '{sector_name}'."
+        if is_called_by_ai: return {"status": "error", "message": msg}
+        else: print(msg); return
 
-    print(f"-> Found {len(all_tickers)} tickers. Analyzing top constituents...")
+    if not is_called_by_ai:
+        print(f"-> Found {len(all_tickers)} tickers. Analyzing top constituents...")
     
     top_10 = await get_top_constituents_by_market_cap(list(all_tickers))
     if not top_10:
-        print("-> Could not determine top constituents. Aborting.")
-        return
+        msg = "-> Could not determine top constituents. Aborting."
+        if is_called_by_ai: return {"status": "error", "message": msg}
+        else: print(msg); return
         
     top_10_tickers = [c['ticker'] for c in top_10]
-    print("\n--- Top 10 by Market Cap ---")
-    print(tabulate([[c['ticker'], f"${humanize.intword(c['market_cap'])}"] for c in top_10], headers=["Ticker", "Market Cap"]))
-
+    
+    # --- MODIFICATION: Handle CLI vs AI output ---
+    
+    # --- Data Gathering (same as original) ---
+    top_10_mc_table = [[c['ticker'], f"${humanize.intword(c['market_cap'])}"] for c in top_10]
     perf_data = await get_sector_performance_change(top_10_tickers)
-    print("\n--- Top 10 Performance ---")
-    perf_table = [[t, f"{perf_data.get(t, {}).get('1M'):.2f}%", f"{perf_data.get(t, {}).get('1Y'):.2f}%"] for t in top_10_tickers]
-    print(tabulate(perf_table, headers=["Ticker", "1M Change", "1Y Change"]))
-
+    perf_table = [[t, f"{perf_data.get(t, {}).get('1M', 0.0):.2f}%", f"{perf_data.get(t, {}).get('1Y', 0.0):.2f}%"] for t in top_10_tickers]
     funda_scores = [res['fundamental_score'] for t in top_10_tickers if (res := await handle_fundamentals_command(ai_params={'ticker': t}, is_called_by_ai=True)) and 'fundamental_score' in res]
     invest_scores = [res[1] for t in top_10_tickers if (res := await calculate_ema_invest(t, 2, is_called_by_ai=True)) and res[1] is not None]
-    print(f"\n--- Health Scores (Top 10) ---")
-    print(f"-> Avg. Fundamental Score: {sum(funda_scores)/len(funda_scores):.2f}/100" if funda_scores else "N/A")
-    print(f"-> Avg. Invest Score: {sum(invest_scores)/len(invest_scores):.2f}%" if invest_scores else "N/A")
-
-    print(f"\n--- Top/Bottom 5 by Invest Score (All {len(all_tickers)} Tickers) ---")
+    avg_funda = sum(funda_scores)/len(funda_scores) if funda_scores else None
+    avg_invest = sum(invest_scores)/len(invest_scores) if invest_scores else None
     all_scores = await calculate_market_invest_scores_singularity(list(all_tickers), 2, is_called_by_ai=True)
+    top_5, bottom_5 = [], []
     if all_scores:
-        top_5, bottom_5 = all_scores[:5], sorted(all_scores[-5:], key=lambda x: x.get('score', float('inf')))
-        print("\n**Top 5**"); print(tabulate(top_5, headers="keys"))
-        print("\n**Bottom 5**"); print(tabulate(bottom_5, headers="keys"))
-
-    print(f"\n--- Sentiment Analysis for '{sector_name}' ---")
+        top_5 = all_scores[:5]
+        bottom_5 = sorted(all_scores[-5:], key=lambda x: x.get('score', float('inf')))
     headlines = await scrape_sector_news_headlines(sector_name)
+    sentiment = None
     if headlines:
         sentiment = await get_ai_sentiment_analysis("\n".join(headlines), sector_name)
-        if sentiment: print(f"  Score: {sentiment.get('sentiment_score', 0.0):.2f} | Summary: {sentiment.get('summary', 'N/A')}")
+
+    # --- Output Handling ---
+    if is_called_by_ai:
+        # AI wants a structured dictionary
+        return {
+            "status": "success",
+            "sector_name": sector_name,
+            "total_tickers_found": len(all_tickers),
+            "top_10_by_market_cap": [{
+                "ticker": c[0], 
+                "market_cap": c[1]
+            } for c in top_10_mc_table],
+            "top_10_performance": [{
+                "ticker": p[0], 
+                "1M_change": p[1], 
+                "1Y_change": p[2]
+            } for p in perf_table],
+            "top_10_health": {
+                "avg_fundamental_score": f"{avg_funda:.2f}/100" if avg_funda else "N/A",
+                "avg_invest_score": f"{avg_invest:.2f}%" if avg_invest else "N/A"
+            },
+            "market_leaders_invest_score": top_5,
+            "market_laggards_invest_score": bottom_5,
+            "sentiment_analysis": {
+                "score": f"{sentiment.get('sentiment_score', 0.0):.2f}" if sentiment else "N/A",
+                "summary": sentiment.get('summary', 'N/A') if sentiment else "N/A"
+            }
+        }
+    else:
+        # CLI user gets printed tables
+        print("\n--- Top 10 by Market Cap ---")
+        print(tabulate(top_10_mc_table, headers=["Ticker", "Market Cap"]))
+        print("\n--- Top 10 Performance ---")
+        print(tabulate(perf_table, headers=["Ticker", "1M Change", "1Y Change"]))
+        print(f"\n--- Health Scores (Top 10) ---")
+        print(f"-> Avg. Fundamental Score: {avg_funda:.2f}/100" if avg_funda else "N/A")
+        print(f"-> Avg. Invest Score: {avg_invest:.2f}%" if avg_invest else "N/A")
+        print(f"\n--- Top/Bottom 5 by Invest Score (All {len(all_tickers)} Tickers) ---")
+        if all_scores:
+            print("\n**Top 5**"); print(tabulate(top_5, headers="keys"))
+            print("\n**Bottom 5**"); print(tabulate(bottom_5, headers="keys"))
+        print(f"\n--- Sentiment Analysis for '{sector_name}' ---")
+        if sentiment: 
+            print(f"  Score: {sentiment.get('sentiment_score', 0.0):.2f} | Summary: {sentiment.get('summary', 'N/A')}")
+        return
+    # --- END MODIFICATION ---

@@ -2,6 +2,8 @@
 import asyncio
 import uuid
 from typing import List, Dict, Optional, Any
+from datetime import datetime
+import pytz # <-- ADDED IMPORT
 
 import yfinance as yf
 import pandas as pd
@@ -243,6 +245,155 @@ def plot_busd_graph(data: pd.DataFrame, ticker: str, signal: str):
         return "Failed to generate graph."
 
 
+# --- NEW HELPER FUNCTIONS FOR MARKET OPEN STRATEGY ---
+
+async def _get_market_open_range_and_data(ticker: str) -> Optional[Dict[str, Any]]:
+    """Fetches 5m and 1m data for today, identifies 9:30-9:35 range."""
+    try:
+        tz = pytz.timezone("America/New_York")
+        today = datetime.now(tz).strftime('%Y-%m-%d')
+
+        # 1. Get 1-minute data for the whole day (max 7 days back for 1m interval)
+        one_min_data = await get_yf_download_robustly(
+            [ticker], period="1d", interval="1m", auto_adjust=False
+        )
+        if one_min_data.empty:
+            print("   -> ❌ Error: Could not fetch 1-minute intraday data.")
+            return None
+        
+        # Localize index to EST/EDT
+        one_min_data.index = one_min_data.index.tz_convert("America/New_York")
+        one_min_data_today = one_min_data.loc[today]
+
+        # 2. Get 5-minute data to find the 9:30 candle
+        five_min_data = await get_yf_download_robustly(
+            [ticker], period="1d", interval="5m", auto_adjust=False
+        )
+        if five_min_data.empty:
+            print("   -> ❌ Error: Could not fetch 5-minute intraday data.")
+            return None
+            
+        five_min_data.index = five_min_data.index.tz_convert("America/New_York")
+        five_min_data_today = five_min_data.loc[today]
+
+        # Find the 9:30 candle
+        open_candle = five_min_data_today.at_time("09:30")
+        if open_candle.empty:
+            print("   -> ❌ Error: Could not find 9:30 AM 5-minute candle. Market may be closed or data delayed.")
+            return None
+            
+        initial_high = open_candle['High'].iloc[0]
+        initial_low = open_candle['Low'].iloc[0]
+        
+        # 3. Determine Tick Size (simplified)
+        # We assume $0.01 for equities as yfinance doesn't provide this.
+        tick_size = 0.01 
+        
+        # 4. Filter 1-minute data to start *after* the initial range
+        one_min_data_after_open = one_min_data_today.between_time("09:36", "16:00")
+
+        return {
+            "initial_high": initial_high,
+            "initial_low": initial_low,
+            "tick_size": tick_size,
+            "one_min_data": one_min_data_after_open
+        }
+    except Exception as e:
+        print(f"   -> ❌ Error in _get_market_open_range_and_data: {e}")
+        return None
+
+def _find_fair_value_gap(one_min_data: pd.DataFrame, initial_high: float, initial_low: float) -> Optional[Dict[str, Any]]:
+    """Finds the first FVG outside the initial range."""
+    if len(one_min_data) < 3:
+        return None
+
+    # Iterate from the 3rd candle onwards (index 2)
+    for i in range(2, len(one_min_data)):
+        c1 = one_min_data.iloc[i-2] # Candle 1
+        c2 = one_min_data.iloc[i-1] # Candle 2 (middle)
+        c3 = one_min_data.iloc[i]   # Candle 3
+
+        # Check for Bullish FVG (Gap between C1 High and C3 Low)
+        if c1['High'] < c3['Low']:
+            fvg_bottom = c1['High']
+            fvg_top = c3['Low']
+            # Check if FVG is entirely above the initial range
+            if fvg_bottom > initial_high:
+                return {
+                    "type": "bullish",
+                    "fvg_top": fvg_top,
+                    "fvg_bottom": fvg_bottom,
+                    "fvg_end_index": i 
+                }
+        
+        # Check for Bearish FVG (Gap between C1 Low and C3 High)
+        elif c1['Low'] > c3['High']:
+            fvg_bottom = c3['High']
+            fvg_top = c1['Low']
+            # Check if FVG is entirely below the initial range
+            if fvg_top < initial_low:
+                return {
+                    "type": "bearish",
+                    "fvg_top": fvg_top,
+                    "fvg_bottom": fvg_bottom,
+                    "fvg_end_index": i
+                }
+                
+    return None # No FVG found
+
+def _find_retracement(one_min_data: pd.DataFrame, fvg_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Finds the first candle that retraces into the FVG."""
+    start_index = fvg_data["fvg_end_index"] + 1
+    if start_index >= len(one_min_data):
+        return None
+
+    fvg_type = fvg_data["type"]
+    fvg_top = fvg_data["fvg_top"]
+    fvg_bottom = fvg_data["fvg_bottom"]
+
+    for i in range(start_index, len(one_min_data)):
+        candle = one_min_data.iloc[i]
+        
+        if fvg_type == "bullish":
+            # Candle low dips into the gap
+            if candle['Low'] <= fvg_top:
+                return {"candle": candle, "index": i}
+        
+        elif fvg_type == "bearish":
+            # Candle high pokes into the gap
+            if candle['High'] >= fvg_bottom:
+                return {"candle": candle, "index": i}
+                
+    return None # No retracement found
+
+def _check_engulfing_candle(one_min_data: pd.DataFrame, fvg_type: str, retracement_candle: pd.Series, retracement_index: int) -> Optional[pd.Series]:
+    """Checks if the *next* candle is engulfing."""
+    engulfing_index = retracement_index + 1
+    if engulfing_index >= len(one_min_data):
+        return None # No next candle to check
+
+    candle_i = retracement_candle
+    candle_i1 = one_min_data.iloc[engulfing_index]
+
+    if fvg_type == "bullish":
+        # Check for Bullish Engulfing: Body of i+1 engulfs body of i
+        is_bullish_candle = candle_i1['Close'] > candle_i1['Open']
+        is_engulfing = candle_i1['Close'] > candle_i['Close'] and candle_i1['Open'] < candle_i['Open']
+        if is_bullish_candle and is_engulfing:
+            return candle_i1
+            
+    elif fvg_type == "bearish":
+        # Check for Bearish Engulfing: Body of i+1 engulfs body of i
+        is_bearish_candle = candle_i1['Close'] < candle_i1['Open']
+        is_engulfing = candle_i1['Close'] < candle_i['Close'] and candle_i1['Open'] > candle_i['Open']
+        if is_bearish_candle and is_engulfing:
+            return candle_i1
+
+    return None # Not an engulfing candle
+
+# --- END NEW HELPER FUNCTIONS ---
+
+
 # --- Individual Strategy Functions ---
 
 async def get_strategy_data(ticker_input: str, period: str = "2y") -> Optional[Dict[str, Any]]:
@@ -367,17 +518,80 @@ async def run_busd_strategy(ticker_input: str, lock: asyncio.Lock) -> Optional[D
         graph_file = await asyncio.to_thread(plot_busd_graph, data.tail(252), yf_ticker, latest['signal'])
     return {"display_name": display_name, "signal": latest['signal'], "graph_file": graph_file}
 
+# --- NEW: Market Open Trade Strategy Function ---
+
+async def run_market_open_trade_strategy(ticker_input: str, lock: asyncio.Lock) -> Optional[Dict[str, Any]]:
+    """
+    Runs the 'Market Open Trade' (FVG) strategy.
+    This strategy MUST be run during or just after market hours.
+    """
+    ticker_upper = ticker_input.upper().replace('/', '')
+    
+    # This strategy doesn't plot, so we don't need the lock.
+    # We pass it anyway to maintain the function signature.
+    
+    try:
+        # 1. Get initial range and 1-minute data
+        data = await _get_market_open_range_and_data(ticker_upper)
+        if data is None:
+            return {"display_name": ticker_upper, "signal": "HOLD 🟡 (Strategy conditions not met: Could not get valid market open data.)", "graph_file": "N/A"}
+
+        one_min_data = data["one_min_data"]
+        if one_min_data.empty or len(one_min_data) < 5: # Need at least a few candles to trade
+            return {"display_name": ticker_upper, "signal": "HOLD 🟡 (Strategy conditions not met: Not enough 1-minute data found after 9:35 AM.)", "graph_file": "N/A"}
+
+        # 2. Find first FVG outside the range
+        fvg_data = _find_fair_value_gap(one_min_data, data["initial_high"], data["initial_low"])
+        if fvg_data is None:
+            return {"display_name": ticker_upper, "signal": "HOLD 🟡 (Strategy conditions not met: No Fair Value Gap (FVG) formed outside the initial 5-min range.)", "graph_file": "N/A"}
+
+        # 3. Find first retracement into the FVG
+        retracement_data = _find_retracement(one_min_data, fvg_data)
+        if retracement_data is None:
+            return {"display_name": ticker_upper, "signal": "HOLD 🟡 (Strategy conditions not met: An FVG was found, but no 1-minute candle retraced back into it.)", "graph_file": "N/A"}
+
+        # 4. Check for the next candle to be engulfing
+        engulfing_candle = _check_engulfing_candle(one_min_data, fvg_data["type"], retracement_data["candle"], retracement_data["index"])
+        if engulfing_candle is None:
+            return {"display_name": ticker_upper, "signal": "HOLD 🟡 (Strategy conditions not met: A retracement into the FVG occurred, but the next candle was not an engulfing candle.)", "graph_file": "N/A"}
+
+        # 5. All conditions met, calculate trade
+        entry_price = engulfing_candle['Close']
+        retracement_candle = retracement_data["candle"]
+        tick_size = data["tick_size"]
+        
+        if fvg_data["type"] == "bullish":
+            stop_loss = retracement_candle['Low'] - tick_size
+            risk_per_share = entry_price - stop_loss
+            take_profit = entry_price + (3 * risk_per_share)
+            signal_str = f"BUY 🟢 (Market Open FVG)\n  Entry: ~${entry_price:.2f}\n  Stop Loss: ${stop_loss:.2f}\n  Take Profit: ${take_profit:.2f}"
+        
+        else: # Bearish
+            stop_loss = retracement_candle['High'] + tick_size
+            risk_per_share = stop_loss - entry_price
+            take_profit = entry_price - (3 * risk_per_share)
+            signal_str = f"SELL 🔴 (Market Open FVG)\n  Entry: ~${entry_price:.2f}\n  Stop Loss: ${stop_loss:.2f}\n  Take Profit: ${take_profit:.2f}"
+
+        return {"display_name": ticker_upper, "signal": signal_str, "graph_file": "N/A (Intraday 1m)"}
+
+    except Exception as e:
+        return {"display_name": ticker_upper, "signal": f"HOLD 🟡 (Strategy Error: {e})", "graph_file": "N/A"}
+
+
 # --- Aggregate Strategy Function ---
 
 async def run_average_strategy(ticker: str):
     """Runs all available strategies and calculates a consensus signal."""
+    
+    # --- MODIFICATION: Added new strategy to lists ---
     strategy_functions = [
         run_trend_following_strategy,
         run_mean_reversion_strategy,
         run_volatility_breakout_strategy,
         run_ma_crossover_strategy,
         run_simple_rsi_strategy,
-        run_busd_strategy
+        run_busd_strategy,
+        run_market_open_trade_strategy # <-- ADDED
     ]
     strategy_names = [
         "Trend Following (EMA/ADX)",
@@ -385,8 +599,10 @@ async def run_average_strategy(ticker: str):
         "Volatility Breakout",
         "MA Crossover (SMA 50/200)",
         "Simple RSI (30/70)",
-        "Daily Momentum (BUSD)"
+        "Daily Momentum (BUSD)",
+        "Market Open Trade (FVG)" # <-- ADDED
     ]
+    # --- END MODIFICATION ---
 
     print(f"\n--- Running All Strategies for {ticker.upper()} ---")
     
@@ -447,7 +663,10 @@ async def handle_strategies_command(args: List[str], ai_params: Optional[Dict] =
         print("4. MA Crossover (50/200 SMA)")
         print("5. Simple RSI (Overbought/Oversold)")
         print("6. Daily Momentum (Buy Up-Day/Sell Down-Day)")
-        print("avg. Run all strategies for a consensus signal")
+        print("7. Market Open Trade (9:30 FVG)")
+        # --- MODIFICATION: Updated help text ---
+        print("avg. Run all strategies (1-7) for a consensus signal")
+        # --- END MODIFICATION ---
         print("\nUsage: /strategies <strategy_number_or_avg> <ticker>")
         return
 
@@ -469,13 +688,14 @@ async def handle_strategies_command(args: List[str], ai_params: Optional[Dict] =
         "4": run_ma_crossover_strategy,
         "5": run_simple_rsi_strategy,
         "6": run_busd_strategy,
+        "7": run_market_open_trade_strategy, # <-- This was already correct
     }
 
     strategy_func = strategy_map.get(strategy_num)
     if strategy_func:
         results = await strategy_func(ticker, plt_lock)
     else:
-        print(f"Error: Strategy '{strategy_num}' is not valid. Use 1-6 or avg.")
+        print(f"Error: Strategy '{strategy_num}' is not valid. Use 1-7 or avg.") # <-- Updated max range
         return
 
     if results:

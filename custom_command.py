@@ -164,6 +164,25 @@ async def _save_custom_portfolio_run_to_csv(portfolio_code: str, tailored_stock_
     timestamp_utc_str = datetime.now(pytz.UTC).isoformat()
     data_for_csv = []
     
+    # Pre-processing to enforce BYDDY Integer Rounding before saving
+    for holding in tailored_stock_holdings:
+        ticker = holding.get('ticker')
+        if ticker and ticker.upper() == 'BYDDY':
+            try:
+                shares = float(holding.get('shares', 0.0))
+                price = float(holding.get('live_price_at_eval', 0.0))
+                # Force round to nearest integer
+                new_shares = round(shares)
+                holding['shares'] = str(new_shares)
+                
+                # Adjust allocation values to match new share count if price is valid
+                if price > 0:
+                    holding['actual_money_allocation'] = str(new_shares * price)
+                    if total_portfolio_value_for_percent_calc:
+                         holding['actual_percent_allocation'] = str(((new_shares * price) / total_portfolio_value_for_percent_calc) * 100)
+            except (ValueError, TypeError):
+                pass # Fallback to original if conversion fails
+
     for holding in tailored_stock_holdings:
         # Format the path list into a user-friendly string
         path_str = ' > '.join(map(str, holding.get('path', [])))
@@ -522,4 +541,36 @@ async def handle_custom_command(args: List[str], ai_params: Optional[Dict] = Non
             except Exception as e_custom_cli_run:
                 print(f"CLI Error processing portfolio '{portfolio_code_cli}': {e_custom_cli_run}")
                 traceback.print_exc()
+        return None
+    
+async def load_portfolio_config(portfolio_code: str) -> Optional[Dict[str, Any]]:
+    """Robustly loads a specific portfolio's configuration from the database CSV."""
+    if not os.path.exists(PORTFOLIO_DB_FILE):
+        print(f"❌ Error: Portfolio database file '{PORTFOLIO_DB_FILE}' not found.")
+        return None
+        
+    try:
+        with open(PORTFOLIO_DB_FILE, mode='r', encoding='utf-8') as infile:
+            # Use skipinitialspace=True to handle whitespace in data rows
+            reader = csv.reader(infile, skipinitialspace=True)
+            try:
+                header = [h.strip() for h in next(reader)]
+            except StopIteration:
+                return None # Empty file
+
+            try:
+                code_index = header.index('portfolio_code')
+            except ValueError:
+                print(f"❌ Error: 'portfolio_code' column not found in '{PORTFOLIO_DB_FILE}'.")
+                return None
+
+            for row in reader:
+                if len(row) > code_index and str(row[code_index]).lower() == portfolio_code.lower():
+                    padded_row = row + [None] * (len(header) - len(row))
+                    return dict(zip(header, padded_row))
+        
+        print(f"❌ Error: Portfolio configuration for '{portfolio_code}' not found in database.")
+        return None
+    except Exception as e:
+        print(f"❌ Error loading portfolio configuration: {e}")
         return None

@@ -157,20 +157,29 @@ async def handle_mlforecast_command(args: List[str] = None, ai_params: dict = No
     try:
         # 1. Data Fetching and Prep
         data_daily = pd.DataFrame()
-        fetch_periods_days = {"10-Year": 3650, "5-Year": 1825, "3-Year": 1095, "1-Year": 365}
+        
+        # --- START OF FIX ---
+        # Changed keys from days to yfinance-compatible period strings
+        fetch_periods_map = {"10-Year": "10y", "5-Year": "5y", "3-Year": "3y", "1-Year": "1y"}
+        # --- END OF FIX ---
+        
         successful_period_name = None
-        for period_name, days in fetch_periods_days.items():
+        
+        # --- MODIFIED LOOP ---
+        for period_name, period_str in fetch_periods_map.items():
             if not is_called_by_ai: print(f"-> Attempting to fetch {period_name} of historical data...")
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=days)
+            
+            # Pass the period string directly to yfinance
             temp_data = await asyncio.to_thread(
-                yf.download, ticker, start=start_date, end=end_date, progress=False, auto_adjust=True
+                yf.download, ticker, period=period_str, progress=False, auto_adjust=True
             )
-            if not temp_data.empty and len(temp_data) > 504:
+            
+            if not temp_data.empty and len(temp_data) > 504: # Need > 2 years of data for 1-year forecast
                 data_daily = temp_data
                 successful_period_name = period_name
                 if not is_called_by_ai: print(f"   -> Successfully fetched {successful_period_name} of data.")
                 break
+        # --- END MODIFIED LOOP ---
         
         if data_daily.empty:
             message = f"❌ Error: Not enough historical data found for {ticker} to perform a forecast."
@@ -188,8 +197,8 @@ async def handle_mlforecast_command(args: List[str] = None, ai_params: dict = No
             "5-Day": {"days": 5, "data": data_daily, "min_hist_days": 90},
             "1-Month (21-Day)": {"days": 21, "data": data_daily, "min_hist_days": 180},
             "3-Month (63-Day)": {"days": 63, "data": data_daily, "min_hist_days": 365},
-            "6-Month (26-Week)": {"days": 26, "data": data_weekly, "min_hist_days": 1095},
-            "1-Year (52-Week)": {"days": 52, "data": data_weekly, "min_hist_days": 1825},
+            "6-Month (26-Week)": {"days": 26, "data": data_weekly, "min_hist_days": 1095}, # ~2 years of weekly data
+            "1-Year (52-Week)": {"days": 52, "data": data_weekly, "min_hist_days": 1825}, # ~3.5 years of weekly data
         }
         
         available_data_days = (data_daily.index[-1] - data_daily.index[0]).days

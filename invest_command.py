@@ -231,6 +231,7 @@ def generate_portfolio_pie_chart(portfolio_allocations: List[Dict[str, Any]], ch
 
 # --- Core Logic for /invest and /custom ---
 # <<< START: REPLACEMENT FOR process_custom_portfolio >>>
+# <<< REPLACEMENT FOR process_custom_portfolio >>>
 async def process_custom_portfolio(
     portfolio_data_config: Dict[str, Any],
     tailor_portfolio_requested: bool,
@@ -396,6 +397,16 @@ async def process_custom_portfolio(
         current_tailored_entries_for_calc = []
         total_actual_money_spent_on_stocks = 0.0
         
+        # --- MODIFIED ROUNDING LOGIC START ---
+        # Determine rounding precision
+        active_assets_count = sum(1 for entry in final_combined_portfolio_data_calc if safe_score(entry.get('combined_percent_allocation', 0.0)) > 1e-9 and safe_score(entry.get('live_price', 0.0)) > 0)
+        avg_allocation = total_value_float_for_tailor / active_assets_count if active_assets_count > 0 else 0.0
+        
+        # Rule: If Value < 1000 OR Avg Alloc < 250 -> Round down to 2 decimals (hundredths)
+        # Else -> Round down to 1 decimal (tenths)
+        use_hundredths = (total_value_float_for_tailor < 1000) or (avg_allocation < 250)
+        # --- MODIFIED ROUNDING LOGIC END ---
+
         for entry_tailoring in final_combined_portfolio_data_calc:
             final_stock_alloc_pct_tailor = safe_score(entry_tailoring.get('combined_percent_allocation', 0.0))
             live_price_for_tailor = safe_score(entry_tailoring.get('live_price', 0.0))
@@ -403,8 +414,15 @@ async def process_custom_portfolio(
                 ideal_dollar_allocation = total_value_float_for_tailor * (final_stock_alloc_pct_tailor / 100.0)
                 
                 if frac_shares_singularity:
-                    shares_to_buy = round(ideal_dollar_allocation / live_price_for_tailor, 1)
+                    raw_shares = ideal_dollar_allocation / live_price_for_tailor
+                    if use_hundredths:
+                        # Round DOWN to 2 decimal places (hundredths)
+                        shares_to_buy = math.floor(raw_shares * 100) / 100.0
+                    else:
+                        # Round DOWN to 1 decimal place (tenths)
+                        shares_to_buy = math.floor(raw_shares * 10) / 10.0
                 else:
+                    # Whole shares, always floor
                     shares_to_buy = float(math.floor(ideal_dollar_allocation / live_price_for_tailor))
                 
                 actual_money_allocated = shares_to_buy * live_price_for_tailor
@@ -428,7 +446,12 @@ async def process_custom_portfolio(
         
         if not suppress_prints:
             print("\n--- Tailored Portfolio (Shares) ---")
-            share_format = "{:.1f}" if frac_shares_singularity else "{:.0f}"
+            
+            if frac_shares_singularity:
+                share_format = "{:.2f}" if use_hundredths else "{:.1f}"
+            else:
+                share_format = "{:.0f}"
+                
             tailored_portfolio_output_list_final = [f"{item['ticker']} - {share_format.format(item['shares'])} shares" for item in tailored_portfolio_structured_data]
             print("\n".join(tailored_portfolio_output_list_final))
             print(f"Final Cash Value: ${final_cash_value_tailored:,.2f}")
@@ -450,6 +473,7 @@ async def process_custom_portfolio(
     
     return tailored_portfolio_output_list_final, final_combined_portfolio_data_calc, final_cash_value_tailored, tailored_portfolio_structured_data
 # <<< END: REPLACEMENT FOR process_custom_portfolio >>>
+# # <<< END: REPLACEMENT FOR process_custom_portfolio >>>
 
 # --- Main Handler for /invest ---
 async def handle_invest_command(args: List[str], ai_params: Optional[Dict] = None, is_called_by_ai: bool = False, return_structured_data: bool = False):

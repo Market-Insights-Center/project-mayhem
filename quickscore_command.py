@@ -64,10 +64,12 @@ def plot_ticker_graph(ticker: str, ema_interval: int, is_called_by_ai: bool = Fa
         filename = f"{ticker}_graph_{uuid.uuid4().hex[:6]}.png"
         plt.savefig(filename, facecolor='black', edgecolor='black')
         plt.close(fig)
-        if not is_called_by_ai: print(f"📂 Graph saved: {filename}")
+        # --- MODIFICATION: Removed emoji ---
+        if not is_called_by_ai: print(f"Graph saved: {filename}")
         return filename
     except Exception as e:
-        if not is_called_by_ai: print(f"❌ Error plotting graph for {ticker}: {e}")
+        # --- MODIFICATION: Removed emoji ---
+        if not is_called_by_ai: print(f"[Error] plotting graph for {ticker}: {e}")
         if 'fig' in locals() and plt.fignum_exists(fig.number): plt.close(fig)
         return None
 
@@ -106,4 +108,20 @@ async def handle_quickscore_command(args: List[str], ai_params: Optional[Dict]=N
     summary = f"Quickscore for {ticker_qs}: Price {live_price_qs_display}. Scores: "
     summary += ", ".join([f"{sensitivity_map[sk]} {scores_qs.get(sk,'N/A')}" for sk in sensitivity_map]) + ". "
     summary += "Graphs: " + ", ".join([g for g in graphs_qs_files if "Failed" not in g]) + "."
+    
+    # --- MODIFICATION: Return dict for AI, str for logging summary ---
+    # The workflow executor in prometheus_core.py expects a dictionary
+    # for /quickscore, but this function was only returning a string.
+    # The executor's summarization logic will handle this dict.
+    if is_called_by_ai:
+        return {
+            "status": "success",
+            "ticker": ticker_qs,
+            "live_price": live_price_qs_display,
+            "scores": scores_qs,
+            "graphs": graphs_qs_files,
+            "summary": summary
+        }
+    
+    # Return the string summary for logging if called by user
     return summary

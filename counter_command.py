@@ -18,7 +18,8 @@ TRACKABLE_COMMANDS = [
     "/quickscore", "/risk", "/history", "/simulation", "/macdforecast", "/heatmap", 
     "/fundamentals", "/optimize", "/sentiment", "/mlforecast", "/powerscore", 
     "/compare", "/sector", "/favorites", "/backtest", "/web", "/help", "/counter",
-    "/dev", "/futures", "/strategies", "/tracking", "/fairvalue", "/derivative"
+    "/dev", "/futures", "/strategies", "/tracking", "/fairvalue", "/derivative", 
+    "/prometheus", "/kronos", "/nexus" # <<< ADDED /nexus
 ]
 
 # --- Counter System Logic (moved for self-containment) ---
