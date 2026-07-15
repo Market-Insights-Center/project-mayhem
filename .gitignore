@@ -182,6 +182,10 @@ cython_debug/
 
 # --- M.I.C. Singularity Specific Ignores ---
 
+# Windows Explorer folder metadata
+desktop.ini
+Thumbs.db
+
 # CRITICAL: Ignore configuration file with API keys
 config.ini
 
